@@ -2,6 +2,7 @@ import {info, warning} from '@actions/core'
 // eslint-disable-next-line camelcase
 import {context as github_context} from '@actions/github'
 import {octokit} from './octokit'
+import {graphqlWithAuth} from './graphql-client'
 
 // eslint-disable-next-line camelcase
 const context = github_context
@@ -177,13 +178,15 @@ ${tag}`
     startLine: number
     endLine: number
     message: string
+    score: number
   }> = []
 
   async bufferReviewComment(
     path: string,
     startLine: number,
     endLine: number,
-    message: string
+    message: string,
+    score: number = 5
   ) {
     message = `${COMMENT_GREETING}
 
@@ -194,6 +197,7 @@ ${COMMENT_TAG}`
       path,
       startLine,
       endLine,
+      score,
       message
     })
   }
@@ -287,9 +291,11 @@ ${statusMsg}
     await this.deletePendingReview(pullNumber)
 
     const generateCommentData = (comment: any) => {
+      // Include score in comment body for visibility
+      const scorePrefix = `**Severity: ${comment.score}/10**\n\n`
       const commentData: any = {
         path: comment.path,
-        body: comment.message,
+        body: scorePrefix + comment.message,
         line: comment.endLine
       }
 
@@ -428,16 +434,25 @@ ${COMMENT_REPLY_TAG}
     startLine: number,
     endLine: number
   ) {
-    const comments = await this.listReviewComments(pullNumber)
-    return comments.filter(
-      (comment: any) =>
-        comment.path === path &&
-        comment.body !== '' &&
-        ((comment.start_line !== undefined &&
-          comment.start_line >= startLine &&
-          comment.line <= endLine) ||
-          (startLine === endLine && comment.line === endLine))
-    )
+    try {
+      // Get all comments using the cached method
+      const allComments = await this.listReviewComments(pullNumber)
+
+      // Filter comments for the specific file and line range
+      return allComments.filter(
+        comment =>
+          comment.path === path &&
+          ((comment.start_line !== null &&
+            comment.start_line >= startLine &&
+            comment.line <= endLine) ||
+            (startLine === endLine && comment.line === endLine))
+      )
+    } catch (e) {
+      warning(
+        `Failed to get comments within range for ${path}:${startLine}-${endLine}: ${e}`
+      )
+      return []
+    }
   }
 
   async getCommentsAtRange(
@@ -446,16 +461,53 @@ ${COMMENT_REPLY_TAG}
     startLine: number,
     endLine: number
   ) {
-    const comments = await this.listReviewComments(pullNumber)
-    return comments.filter(
-      (comment: any) =>
-        comment.path === path &&
-        comment.body !== '' &&
-        ((comment.start_line !== undefined &&
-          comment.start_line === startLine &&
-          comment.line === endLine) ||
-          (startLine === endLine && comment.line === endLine))
+    try {
+      // Get all comments first using our existing method
+      const allComments = await this.listReviewComments(pullNumber)
+
+      // Filter comments for the specific file and line range
+      return allComments.filter(
+        comment =>
+          comment.path === path &&
+          ((comment.start_line !== null &&
+            comment.start_line === startLine &&
+            comment.line === endLine) ||
+            (startLine === endLine && comment.line === endLine))
+      )
+    } catch (e) {
+      warning(
+        `Failed to get comments at range for ${path}:${startLine}-${endLine}: ${e}`
+      )
+      return []
+    }
+  }
+
+  /**
+   * Check if a comment at a specific location is resolved
+   */
+  async checkCommentResolution(
+    pullNumber: number,
+    filename: string,
+    startLine: number,
+    endLine: number
+  ): Promise<boolean> {
+    const comments = await this.getCommentsAtRange(
+      pullNumber,
+      filename,
+      startLine,
+      endLine
     )
+
+    for (const comment of comments) {
+      if (
+        comment.body.includes(COMMENT_TAG) &&
+        (comment.resolved === true || comment.state === 'RESOLVED')
+      ) {
+        return true
+      }
+    }
+
+    return false
   }
 
   async getCommentChainsWithinRange(
@@ -561,32 +613,107 @@ ${chain}
       return this.reviewCommentsCache[target]
     }
 
-    const allComments: any[] = []
-    let page = 1
-    try {
-      for (;;) {
-        const {data: comments} = await octokit.pulls.listReviewComments({
-          owner: repo.owner,
-          repo: repo.repo,
-          // eslint-disable-next-line camelcase
-          pull_number: target,
-          page,
-          // eslint-disable-next-line camelcase
-          per_page: 100
-        })
-        allComments.push(...comments)
-        page++
-        if (!comments || comments.length < 100) {
-          break
+    // Try to use GraphQL for better performance
+    const result = await graphqlWithAuth<{
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            nodes: Array<{
+              id: string
+              isResolved: boolean
+              path: string
+              comments: {
+                nodes: Array<{
+                  id: string
+                  fullDatabaseId: number
+                  path: string
+                  body: string
+                  line: number
+                  startLine: number | null
+                  author: {
+                    login: string
+                  }
+                  replyTo: {
+                    fullDatabaseId: number
+                  } | null
+                }>
+              }
+            }>
+          }
         }
       }
+    }>(
+      `
+        query($owner: String!, $repo: String!, $pullNumber: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $pullNumber) {
+              reviewThreads(first: 100) {
+                nodes {
+                  id
+                  isResolved
+                  path
+                  comments(first: 100) {
+                    nodes {
+                      id
+                      fullDatabaseId
+                      path
+                      body
+                      line
+                      startLine
+                      author {
+                        login
+                      }
+                      outdated
+                      replyTo {
+                        fullDatabaseId
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `,
+      {
+        owner: repo.owner,
+        repo: repo.repo,
+        pullNumber: target
+      }
+    )
 
-      this.reviewCommentsCache[target] = allComments
-      return allComments
-    } catch (e) {
-      warning(`Failed to list review comments: ${e}`)
-      return allComments
-    }
+    // Process review threads
+    const allComments =
+      result.repository.pullRequest.reviewThreads.nodes.flatMap(thread =>
+        thread.comments.nodes.map(comment => ({
+          id: comment.fullDatabaseId,
+          // eslint-disable-next-line camelcase
+          node_id: comment.id,
+          path: thread.path,
+          body: comment.body,
+          line: comment.line,
+          // eslint-disable-next-line camelcase
+          start_line: comment.startLine,
+          user: {
+            login: comment.author?.login || 'github-actions[bot]',
+            type: 'Bot'
+          },
+          // eslint-disable-next-line camelcase
+          in_reply_to_id: comment.replyTo?.fullDatabaseId || null,
+          // Set resolution status based on the thread
+          resolved: thread.isResolved,
+          state: thread.isResolved ? 'RESOLVED' : 'OPEN'
+        }))
+      )
+
+    // Remove duplicates
+    const uniqueComments = allComments.filter(
+      (comment, index, self) =>
+        self.findIndex(c => c.id === comment.id) === index
+    )
+
+    this.reviewCommentsCache[target] = uniqueComments
+    return uniqueComments
   }
 
   async create(body: string, target: number) {

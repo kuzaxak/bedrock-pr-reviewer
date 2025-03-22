@@ -1,3 +1,4 @@
+import {Message} from '@aws-sdk/client-bedrock-runtime'
 import {type Inputs} from './inputs'
 
 export class Prompts {
@@ -16,6 +17,10 @@ $title
 <pull_request_description>
 $description
 </pull_request_description>
+
+<commit_messages>
+$commit_messages
+</commit_messages>
 
 <pull_request_diff>
 $file_diff
@@ -66,7 +71,7 @@ Instructions:
 - The summary should not exceed 500 words.
 `
 
-  reviewFileDiff = `
+  reviewFileDiffSystem = `
 $system_message
 
 <pull_request_title>
@@ -81,20 +86,26 @@ $description
 $short_summary
 </pull_request_changes>
 
-## IMPORTANT Instructions
-
 Input: New hunks annotated with line numbers and old hunks (replaced code). Hunks represent incomplete code fragments. Example input is in <example_input> tag below.
-Additional Context: <pull_request_title>, <pull_request_description>, <pull_request_changes> and comment chains. 
+Additional Context: <commit_messages> contain commit messages written by developer, <pull_request_title>, <pull_request_description>, <pull_request_changes> and comment chains. 
 Task: Review new hunks for substantive issues using provided context and respond with comments if necessary.
-Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use JSON output format in <example_output> tag below.
-Use fenced code blocks using the relevant language identifier where applicable.
-Don't annotate code snippets with line numbers. Format and indent code correctly.
-Do not use \`suggestion\` code blocks.
-For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`. The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
+Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use JSON output format in <example_output> tag below. Include a score from 1 (minor) to 10 (critical) to indicate the severity of the issue.
 
+### System Preamble
+- DO follow "Answering rules" without exception.
+- DO write your answers for a well-educated audience.
+- You will be PENALIZED for useless comments. 
+
+## Answering rules
+* Before raising concerns, carefully review the <commit_messages> context as it may already address potential issues. If you see an answer in commit messages trust them, it means that developer already reviewed concern and incorporated it into proposal.
+* Use fenced code blocks using the relevant language identifier where applicable.
+* Don't annotate code snippets with line numbers. Format and indent code correctly.
+* Do not use \`suggestion\` code blocks.
+* For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`. The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
+* Include a score from 1 to 10 for each comment, where 1 indicates a minor issue (style, typo) and 10 indicates a critical issue (security vulnerability, major bug).
 $review_file_diff
 
-If there are no issues found on a line range, you MUST respond with the flag "lgtm": true in the response JSON. Don't stop with unfinished JSON. You MUST output a complete and proper JSON that can be parsed.
+If there are no issues found on a line range, you MUST respond with comment "lgtm". Don't stop with unfinished JSON. You MUST output a complete and proper JSON that can be parsed.
 
 <example_input>
 <new_hunk>
@@ -130,26 +141,34 @@ Please review this change.
 \`\`\`
 </comment_chains>
 </example_input>
+`
 
-<example_output>
+  reviewFileDiffAssistant = `
 {
   "reviews": [
     {
       "line_start": 22,
       "line_end": 22,
       "comment": "There's a syntax error in the add function.\\n  -    retrn z\\n  +    return z",
+      "score": 7
     },
     {
       "line_start": 23,
       "line_end": 24,
       "comment": "There's a redundant new line here. It should be only one.",
+      "score": 2
     }
   ],
   "lgtm": false
 }
-</example_output>
+`
 
+  reviewFileDiffUser = `
 ## Changes made to \`$filename\` for your review
+
+<commit_messages>
+$commit_messages
+</commit_messages>
 
 $patches
 `
@@ -216,7 +235,7 @@ $comment
     reviewSimpleChanges: boolean
   ): string {
     let prompt = this.summarizeFileDiff
-    if (reviewSimpleChanges === false) {
+    if (!reviewSimpleChanges) {
       prompt += this.triageFileDiff
     }
     return inputs.render(prompt)
@@ -245,7 +264,32 @@ $comment
     return inputs.render(this.comment)
   }
 
-  renderReviewFileDiff(inputs: Inputs): string {
-    return inputs.render(this.reviewFileDiff)
+  renderReviewFileDiff(inputs: Inputs): Array<Message> {
+    return [
+      {
+        role: 'user',
+        content: [
+          {
+            text: inputs.render(this.reviewFileDiffSystem)
+          }
+        ]
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            text: this.reviewFileDiffAssistant
+          }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            text: inputs.render(this.reviewFileDiffUser)
+          }
+        ]
+      }
+    ]
   }
 }

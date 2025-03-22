@@ -2,8 +2,9 @@ import './fetch-polyfill'
 
 import {
   BedrockRuntimeClient,
-  InvokeModelCommand,
-  InvokeModelCommandOutput
+  ConverseCommand,
+  ConverseCommandOutput,
+  Message
 } from '@aws-sdk/client-bedrock-runtime'
 import {info, warning} from '@actions/core'
 import pRetry from 'p-retry'
@@ -30,7 +31,16 @@ export class Bot {
   chat = async (message: string, prefix?: string): Promise<[string, Ids]> => {
     let res: [string, Ids] = ['', {}]
     try {
-      res = await this.chat_(message, prefix)
+      res = await this.chat_([
+        {
+          role: 'user',
+          content: [
+            {
+              text: `${message}\n${prefix ?? ''}`
+            }
+          ]
+        }
+      ])
       return res
     } catch (e: unknown) {
       warning(`Failed to chat: ${e}`)
@@ -38,61 +48,39 @@ export class Bot {
     }
   }
 
+  roleplayChat = async (prompt: Array<Message>): Promise<[string, Ids]> => {
+    try {
+      return await this.chat_(prompt)
+    } catch (e: unknown) {
+      warning(`Failed to chat: ${e}`)
+      return ['', {}]
+    }
+  }
+
   private readonly chat_ = async (
-    message: string,
-    prefix: string = ''
+    prompt: Array<Message>
   ): Promise<[string, Ids]> => {
     // record timing
     const start = Date.now()
-    if (!message) {
+    if (!prompt.length) {
       return ['', {}]
     }
 
-    let response: InvokeModelCommandOutput | undefined
-
-    message = `IMPORTANT: Entire response must be in the language with ISO code: ${this.options.language}\n\n${message}`
+    let response: ConverseCommandOutput | undefined
     try {
       if (this.options.debug) {
-        info(`sending prompt: ${message}\n------------`)
+        info(`sending prompt: ${JSON.stringify(prompt)}\n------------`)
       }
       response = await pRetry(
         () =>
           this.client.send(
-            new InvokeModelCommand({
+            new ConverseCommand({
               modelId: this.bedrockOptions.model,
-              body: JSON.stringify({
-                // eslint-disable-next-line camelcase
-                anthropic_version: 'bedrock-2023-05-31',
-                // eslint-disable-next-line camelcase
-                max_tokens: 4096,
-                temperature: 0,
-                messages: [
-                  {
-                    role: 'user',
-                    content: [
-                      {
-                        type: 'text',
-                        text: message
-                      }
-                    ]
-                  },
-                  ...(prefix
-                    ? [
-                        {
-                          role: 'assistant',
-                          content: [
-                            {
-                              type: 'text',
-                              text: prefix
-                            }
-                          ]
-                        }
-                      ]
-                    : [])
-                ]
-              }),
-              contentType: 'application/json',
-              accept: 'application/json'
+              messages: prompt,
+              inferenceConfig: {
+                maxTokens: 4096,
+                temperature: 0
+              }
             })
           ),
         {
@@ -108,9 +96,8 @@ export class Bot {
     )
 
     let responseText = ''
-    if (response != null) {
-      responseText = JSON.parse(Buffer.from(response.body).toString('utf-8'))
-        .content?.[0]?.text
+    if (response?.output?.message != null) {
+      responseText = response.output?.message.content?.at(-1)?.text ?? ''
     } else {
       warning('bedrock response is null')
     }
@@ -121,6 +108,6 @@ export class Bot {
       parentMessageId: response?.$metadata.requestId,
       conversationId: response?.$metadata.cfId
     }
-    return [prefix + responseText, newIds]
+    return [responseText, newIds]
   }
 }

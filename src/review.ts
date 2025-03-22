@@ -16,7 +16,7 @@ import {Inputs} from './inputs'
 import {octokit} from './octokit'
 import {type Options} from './options'
 import {type Prompts} from './prompts'
-import {getTokenCount} from './tokenizer'
+import {getTokenCount, getTokenCountRolePlay} from './tokenizer'
 
 // eslint-disable-next-line camelcase
 const context = github_context
@@ -165,6 +165,14 @@ export const codeReview = async (
     warning('Skipped: commits is null')
     return
   }
+
+  // Fetch commit messages
+  const commitMessages = commits.map(commit => ({
+    sha: commit.sha,
+    message: commit.commit.message
+  }))
+
+  inputs.commitMessages = commitMessages
 
   // find hunks to review
   const filteredFiles: Array<
@@ -510,6 +518,7 @@ ${
     const reviewsFailed: string[] = []
     let lgtmCount = 0
     let reviewCount = 0
+    let resolvedCommentCount = 0
     const doReview = async (
       filename: string,
       fileContent: string,
@@ -521,7 +530,7 @@ ${
       ins.filename = filename
 
       // calculate tokens based on inputs so far
-      let tokens = getTokenCount(prompts.renderReviewFileDiff(ins))
+      let tokens = getTokenCountRolePlay(prompts.renderReviewFileDiff(ins))
       // loop to calculate total patch tokens
       let patchesToPack = 0
       for (const [, , patch] of patches) {
@@ -603,15 +612,15 @@ ${commentChain}
       if (patchesPacked > 0) {
         // perform review
         try {
-          const [response] = await heavyBot.chat(
-            prompts.renderReviewFileDiff(ins),
-            '{'
+          const [response] = await heavyBot.roleplayChat(
+            prompts.renderReviewFileDiff(ins)
           )
           if (response === '') {
             info('review: nothing obtained from bedrock')
             reviewsFailed.push(`${filename} (no response)`)
             return
           }
+
           // parse review
           const reviews = parseReview(response, patches)
           for (const review of reviews) {
@@ -619,6 +628,7 @@ ${commentChain}
             if (
               !options.reviewCommentLGTM &&
               (review.comment.includes('LGTM') ||
+                review.comment.includes('lgtm') ||
                 review.comment.includes('looks good to me'))
             ) {
               lgtmCount += 1
@@ -630,13 +640,30 @@ ${commentChain}
             }
 
             try {
-              reviewCount += 1
-              await commenter.bufferReviewComment(
+              // Check if a similar comment has been resolved previously
+              const isResolved = await commenter.checkCommentResolution(
+                context.payload.pull_request.number,
                 filename,
                 review.startLine,
-                review.endLine,
-                `${review.comment}`
+                review.endLine
               )
+
+              if (!isResolved) {
+                reviewCount += 1
+                await commenter.bufferReviewComment(
+                  filename,
+                  review.startLine,
+                  review.endLine,
+                  `${review.comment}`,
+                  review.score
+                )
+              } else {
+                // Skip this comment as it was previously resolved
+                info(
+                  `Skipping previously resolved comment for ${filename}:${review.startLine}-${review.endLine}`
+                )
+                resolvedCommentCount += 1
+              }
             } catch (e: any) {
               reviewsFailed.push(`${filename} comment failed (${e as string})`)
             }
@@ -699,6 +726,7 @@ ${
 
 * Review: ${reviewCount}
 * LGTM: ${lgtmCount}
+* Skipped (previously resolved): ${resolvedCommentCount}
 
 </details>
 
@@ -706,14 +734,6 @@ ${
 
 <details>
 <summary>Tips</summary>
-
-### Chat with AI reviewer (\`/reviewbot\`)
-- Reply on review comments left by this bot to ask follow-up questions. A review comment is a comment on a diff or a file.
-- Invite the bot into a review comment chain by tagging \`/reviewbot\` in a reply.
-
-### Code suggestions
-- The bot may make code suggestions, but please review them carefully before committing since the line number ranges may be misaligned. 
-- You can edit the comment made by the bot and manually tweak the suggestion if it is slightly off.
 
 ### Pausing incremental reviews
 - Add \`/reviewbot: ignore\` anywhere in the PR description to pause further reviews from the bot.
@@ -850,6 +870,7 @@ interface Review {
   startLine: number
   endLine: number
   comment: string
+  score: number // 1 (minor) to 10 (critical)
 }
 
 function parseReview(
@@ -860,13 +881,19 @@ function parseReview(
   const reviews: Review[] = []
 
   try {
-    const rawReviews = JSON.parse(response).reviews
+    const responseJson = JSON.parse(response)
+    if (responseJson?.lgtm) {
+      return []
+    }
+
+    const rawReviews = responseJson.reviews
     for (const r of rawReviews) {
       if (r.comment) {
         reviews.push({
           startLine: r.line_start ?? 0,
           endLine: r.line_end ?? 0,
-          comment: r.comment
+          comment: r.comment,
+          score: r.score ?? 5 // Default to medium severity (5) if not specified
         })
       }
     }
