@@ -1,6 +1,6 @@
 // eslint-disable-next-line camelcase
 import {get_encoding} from '@dqbd/tiktoken'
-import {Message} from './bot'
+import {Message} from '@aws-sdk/client-bedrock-runtime'
 
 const tokenizer = get_encoding('cl100k_base')
 
@@ -14,8 +14,17 @@ export function getTokenCount(input: string): number {
 }
 
 export function getTokenCountRolePlay(input: Array<Message>): number {
-  const raw = input.map(
-    m => encode(m.content.replace(/<\|endoftext\|>/g, '')).length
-  )
-  return raw.reduce((a, c) => a + c)
+  const tokenCounts = input.map(message => {
+    if (Array.isArray(message.content)) {
+      return message.content.reduce((sum, part) => {
+        if ('text' in part && typeof part.text === 'string') {
+          return sum + encode(part.text.replace(/<\|endoftext\|>/g, '')).length
+        }
+        return sum
+      }, 0)
+    }
+    return 0
+  })
+
+  return tokenCounts.reduce((total, count) => total + count, 0)
 }

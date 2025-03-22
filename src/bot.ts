@@ -2,8 +2,9 @@ import './fetch-polyfill'
 
 import {
   BedrockRuntimeClient,
-  InvokeModelCommand,
-  InvokeModelCommandOutput
+  ConverseCommand,
+  ConverseCommandOutput,
+  Message
 } from '@aws-sdk/client-bedrock-runtime'
 import {info, warning} from '@actions/core'
 import pRetry from 'p-retry'
@@ -13,11 +14,6 @@ import {BedrockOptions, Options} from './options'
 export interface Ids {
   parentMessageId?: string
   conversationId?: string
-}
-
-export interface Message {
-  role: string
-  content: string
 }
 
 export class Bot {
@@ -32,68 +28,59 @@ export class Bot {
     this.client = new BedrockRuntimeClient({})
   }
 
-  chat = async (message: string, prefix?: string): Promise<string> => {
-    let res = ''
+  chat = async (message: string, prefix?: string): Promise<[string, Ids]> => {
+    let res: [string, Ids] = ['', {}]
     try {
       res = await this.chat_([
-        {role: 'user', content: `${message}\n${prefix ?? ''}`}
+        {
+          role: 'user',
+          content: [
+            {
+              text: `${message}\n${prefix ?? ''}`
+            }
+          ]
+        }
       ])
-      return `${prefix ?? ''}${res}`
+      return res
     } catch (e: unknown) {
       warning(`Failed to chat: ${e}`)
       return res
     }
   }
 
-  roleplayChat = async (prompt: Array<Message>) => {
+  roleplayChat = async (prompt: Array<Message>): Promise<[string, Ids]> => {
     try {
       return await this.chat_(prompt)
     } catch (e: unknown) {
       warning(`Failed to chat: ${e}`)
-      return ''
+      return ['', {}]
     }
   }
 
-  private readonly chat_ = async (prompt: Array<Message>): Promise<string> => {
+  private readonly chat_ = async (
+    prompt: Array<Message>
+  ): Promise<[string, Ids]> => {
     // record timing
     const start = Date.now()
     if (!prompt.length) {
-      return ''
+      return ['', {}]
     }
 
-    let response: InvokeModelCommandOutput | undefined
-    const messages = prompt.map(m => {
-      return {
-        role: m.role,
-        content: [
-          {
-            type: 'text',
-            text: m.content
-          }
-        ]
-      }
-    })
-
+    let response: ConverseCommandOutput | undefined
     try {
       if (this.options.debug) {
-        info(`sending prompt: ${JSON.stringify(messages)}\n------------`)
+        info(`sending prompt: ${JSON.stringify(prompt)}\n------------`)
       }
       response = await pRetry(
         () =>
           this.client.send(
-            new InvokeModelCommand({
+            new ConverseCommand({
               modelId: this.bedrockOptions.model,
-              body: JSON.stringify({
-                // eslint-disable-next-line camelcase
-                anthropic_version: 'bedrock-2023-05-31',
-                // eslint-disable-next-line camelcase
-                max_tokens: 4096,
-                temperature: this.options.bedrockModelTemperature,
-                system: `IMPORTANT: Entire response must be in the language with ISO code: ${this.options.language}`,
-                messages
-              }),
-              contentType: 'application/json',
-              accept: 'application/json'
+              messages: prompt,
+              inferenceConfig: {
+                maxTokens: 4096,
+                temperature: 0
+              }
             })
           ),
         {
@@ -109,16 +96,18 @@ export class Bot {
     )
 
     let responseText = ''
-    if (response != null) {
-      responseText = JSON.parse(Buffer.from(response.body).toString('utf-8'))
-        .content?.[0]?.text
+    if (response?.output?.message != null) {
+      responseText = response.output?.message.content?.at(-1)?.text ?? ''
     } else {
       warning('bedrock response is null')
     }
     if (this.options.debug) {
       info(`bedrock responses: ${responseText}\n-----------`)
     }
-
-    return responseText
+    const newIds: Ids = {
+      parentMessageId: response?.$metadata.requestId,
+      conversationId: response?.$metadata.cfId
+    }
+    return [responseText, newIds]
   }
 }

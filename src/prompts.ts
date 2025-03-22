@@ -1,4 +1,4 @@
-import {Message} from './bot'
+import {Message} from '@aws-sdk/client-bedrock-runtime'
 import {type Inputs} from './inputs'
 
 export class Prompts {
@@ -232,7 +232,7 @@ $comment
     reviewSimpleChanges: boolean
   ): string {
     let prompt = this.summarizeFileDiff
-    if (reviewSimpleChanges === false) {
+    if (!reviewSimpleChanges) {
       prompt += this.triageFileDiff
     }
     return inputs.render(prompt)
@@ -265,15 +265,27 @@ $comment
     return [
       {
         role: 'user',
-        content: inputs.render(this.reviewFileDiffSystem)
+        content: [
+          {
+            text: inputs.render(this.reviewFileDiffSystem)
+          }
+        ]
       },
       {
         role: 'assistant',
-        content: this.reviewFileDiffAssistant
+        content: [
+          {
+            text: this.reviewFileDiffAssistant
+          }
+        ]
       },
       {
         role: 'user',
-        content: inputs.render(this.reviewFileDiffUser)
+        content: [
+          {
+            text: inputs.render(this.reviewFileDiffUser)
+          }
+        ]
       }
     ]
   }
