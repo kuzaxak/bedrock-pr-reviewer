@@ -620,6 +620,7 @@ ${commentChain}
             reviewsFailed.push(`${filename} (no response)`)
             return
           }
+
           // parse review
           const reviews = parseReview(response, patches)
           for (const review of reviews) {
@@ -640,7 +641,7 @@ ${commentChain}
 
             try {
               // Check if a similar comment has been resolved previously
-              const isResolved = await commenter.isCommentResolved(
+              const isResolved = await commenter.checkCommentResolution(
                 context.payload.pull_request.number,
                 filename,
                 review.startLine,
