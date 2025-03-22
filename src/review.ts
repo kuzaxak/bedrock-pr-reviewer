@@ -518,6 +518,7 @@ ${
     const reviewsFailed: string[] = []
     let lgtmCount = 0
     let reviewCount = 0
+    let resolvedCommentCount = 0
     const doReview = async (
       filename: string,
       fileContent: string,
@@ -638,13 +639,30 @@ ${commentChain}
             }
 
             try {
-              reviewCount += 1
-              await commenter.bufferReviewComment(
+              // Check if a similar comment has been resolved previously
+              const isResolved = await commenter.isCommentResolved(
+                context.payload.pull_request.number,
                 filename,
                 review.startLine,
-                review.endLine,
-                `${review.comment}`
+                review.endLine
               )
+
+              if (!isResolved) {
+                reviewCount += 1
+                await commenter.bufferReviewComment(
+                  filename,
+                  review.startLine,
+                  review.endLine,
+                  `${review.comment}`,
+                  review.score
+                )
+              } else {
+                // Skip this comment as it was previously resolved
+                info(
+                  `Skipping previously resolved comment for ${filename}:${review.startLine}-${review.endLine}`
+                )
+                resolvedCommentCount += 1
+              }
             } catch (e: any) {
               reviewsFailed.push(`${filename} comment failed (${e as string})`)
             }
@@ -707,6 +725,7 @@ ${
 
 * Review: ${reviewCount}
 * LGTM: ${lgtmCount}
+* Skipped (previously resolved): ${resolvedCommentCount}
 
 </details>
 
@@ -850,6 +869,7 @@ interface Review {
   startLine: number
   endLine: number
   comment: string
+  score: number // 1 (minor) to 10 (critical)
 }
 
 function parseReview(
@@ -871,7 +891,8 @@ function parseReview(
         reviews.push({
           startLine: r.line_start ?? 0,
           endLine: r.line_end ?? 0,
-          comment: r.comment
+          comment: r.comment,
+          score: r.score ?? 5 // Default to medium severity (5) if not specified
         })
       }
     }

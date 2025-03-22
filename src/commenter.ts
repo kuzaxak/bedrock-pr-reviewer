@@ -177,13 +177,15 @@ ${tag}`
     startLine: number
     endLine: number
     message: string
+    score: number
   }> = []
 
   async bufferReviewComment(
     path: string,
     startLine: number,
     endLine: number,
-    message: string
+    message: string,
+    score: number = 5
   ) {
     message = `${COMMENT_GREETING}
 
@@ -194,6 +196,7 @@ ${COMMENT_TAG}`
       path,
       startLine,
       endLine,
+      score,
       message
     })
   }
@@ -287,9 +290,11 @@ ${statusMsg}
     await this.deletePendingReview(pullNumber)
 
     const generateCommentData = (comment: any) => {
+      // Include score in comment body for visibility
+      const scorePrefix = `**Severity: ${comment.score}/10**\n\n`
       const commentData: any = {
         path: comment.path,
-        body: comment.message,
+        body: scorePrefix + comment.message,
         line: comment.endLine
       }
 
@@ -447,7 +452,9 @@ ${COMMENT_REPLY_TAG}
     endLine: number
   ) {
     const comments = await this.listReviewComments(pullNumber)
-    return comments.filter(
+
+    // First filter comments to the specified range
+    const rangeComments = comments.filter(
       (comment: any) =>
         comment.path === path &&
         comment.body !== '' &&
@@ -456,6 +463,52 @@ ${COMMENT_REPLY_TAG}
           comment.line === endLine) ||
           (startLine === endLine && comment.line === endLine))
     )
+
+    // For each comment in range, check if it's resolved via GitHub API
+    for (const comment of rangeComments) {
+      try {
+        // Get the latest status of the comment which includes resolution status
+        const response = await octokit.pulls.getReviewComment({
+          owner: repo.owner,
+          repo: repo.repo,
+          // eslint-disable-next-line camelcase
+          comment_id: comment.id
+        })
+
+        // Update the comment object with the latest data
+        Object.assign(comment, response.data)
+      } catch (e) {
+        warning(`Failed to get review comment status: ${e}`)
+      }
+    }
+
+    return rangeComments
+  }
+
+  async isCommentResolved(
+    pullNumber: number,
+    filename: string,
+    startLine: number,
+    endLine: number
+  ): Promise<boolean> {
+    const comments = await this.getCommentsAtRange(
+      pullNumber,
+      filename,
+      startLine,
+      endLine
+    )
+
+    for (const comment of comments) {
+      // Check if comment is marked as resolved through GitHub's API
+      if (
+        comment.body.includes(COMMENT_TAG) &&
+        (comment.resolved === true || comment.state === 'RESOLVED')
+      ) {
+        return true
+      }
+    }
+
+    return false
   }
 
   async getCommentChainsWithinRange(

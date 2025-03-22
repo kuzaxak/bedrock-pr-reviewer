@@ -2509,7 +2509,7 @@ ${tag}`;
         }
     }
     reviewCommentsBuffer = [];
-    async bufferReviewComment(path, startLine, endLine, message) {
+    async bufferReviewComment(path, startLine, endLine, message, score = 5) {
         message = `${COMMENT_GREETING}
 
 ${message}
@@ -2519,6 +2519,7 @@ ${COMMENT_TAG}`;
             path,
             startLine,
             endLine,
+            score,
             message
         });
     }
@@ -2598,9 +2599,11 @@ ${statusMsg}
         }
         await this.deletePendingReview(pullNumber);
         const generateCommentData = (comment) => {
+            // Include score in comment body for visibility
+            const scorePrefix = `**Severity: ${comment.score}/10**\n\n`;
             const commentData = {
                 path: comment.path,
-                body: comment.message,
+                body: scorePrefix + comment.message,
                 line: comment.endLine
             };
             if (comment.startLine !== comment.endLine) {
@@ -2723,12 +2726,42 @@ ${COMMENT_REPLY_TAG}
     }
     async getCommentsAtRange(pullNumber, path, startLine, endLine) {
         const comments = await this.listReviewComments(pullNumber);
-        return comments.filter((comment) => comment.path === path &&
+        // First filter comments to the specified range
+        const rangeComments = comments.filter((comment) => comment.path === path &&
             comment.body !== '' &&
             ((comment.start_line !== undefined &&
                 comment.start_line === startLine &&
                 comment.line === endLine) ||
                 (startLine === endLine && comment.line === endLine)));
+        // For each comment in range, check if it's resolved via GitHub API
+        for (const comment of rangeComments) {
+            try {
+                // Get the latest status of the comment which includes resolution status
+                const response = await _octokit__WEBPACK_IMPORTED_MODULE_2__/* .octokit.pulls.getReviewComment */ .K.pulls.getReviewComment({
+                    owner: repo.owner,
+                    repo: repo.repo,
+                    // eslint-disable-next-line camelcase
+                    comment_id: comment.id
+                });
+                // Update the comment object with the latest data
+                Object.assign(comment, response.data);
+            }
+            catch (e) {
+                (0,_actions_core__WEBPACK_IMPORTED_MODULE_0__.warning)(`Failed to get review comment status: ${e}`);
+            }
+        }
+        return rangeComments;
+    }
+    async isCommentResolved(pullNumber, filename, startLine, endLine) {
+        const comments = await this.getCommentsAtRange(pullNumber, filename, startLine, endLine);
+        for (const comment of comments) {
+            // Check if comment is marked as resolved through GitHub's API
+            if (comment.body.includes(COMMENT_TAG) &&
+                (comment.resolved === true || comment.state === 'RESOLVED')) {
+                return true;
+            }
+        }
+        return false;
     }
     async getCommentChainsWithinRange(pullNumber, path, startLine, endLine, tag = '') {
         const existingComments = await this.getCommentsWithinRange(pullNumber, path, startLine, endLine);
@@ -5045,8 +5078,7 @@ class TokenLimits {
             this.responseTokens = 3000;
         }
         else {
-            // The latest models usually have this level of limits.
-            this.maxTokens = 200_000;
+            this.maxTokens = 100_000;
             this.responseTokens = 4096;
         }
         // provide some margin for the request tokens
@@ -5320,7 +5352,7 @@ $short_summary
 Input: New hunks annotated with line numbers and old hunks (replaced code). Hunks represent incomplete code fragments. Example input is in <example_input> tag below.
 Additional Context: <commit_messages> contain commit messages written by developer, <pull_request_title>, <pull_request_description>, <pull_request_changes> and comment chains. 
 Task: Review new hunks for substantive issues using provided context and respond with comments if necessary.
-Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use JSON output format in <example_output> tag below.
+Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use JSON output format in <example_output> tag below. Include a score from 1 (minor) to 10 (critical) to indicate the severity of the issue.
 
 ### System Preamble
 - DO follow "Answering rules" without exception.
@@ -5333,6 +5365,7 @@ Output: Review comments in markdown with exact line number ranges in new hunks. 
 * Don't annotate code snippets with line numbers. Format and indent code correctly.
 * Do not use \`suggestion\` code blocks.
 * For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`. The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
+* Include a score from 1 to 10 for each comment, where 1 indicates a minor issue (style, typo) and 10 indicates a critical issue (security vulnerability, major bug).
 $review_file_diff
 
 If there are no issues found on a line range, you MUST respond with comment "lgtm". Don't stop with unfinished JSON. You MUST output a complete and proper JSON that can be parsed.
@@ -5379,11 +5412,13 @@ Please review this change.
       "line_start": 22,
       "line_end": 22,
       "comment": "There's a syntax error in the add function.\\n  -    retrn z\\n  +    return z",
+      "score": 7
     },
     {
       "line_start": 23,
       "line_end": 24,
       "comment": "There's a redundant new line here. It should be only one.",
+      "score": 2
     }
   ],
   "lgtm": false
@@ -6192,6 +6227,7 @@ ${summariesFailed.length > 0
         const reviewsFailed = [];
         let lgtmCount = 0;
         let reviewCount = 0;
+        let resolvedCommentCount = 0;
         const doReview = async (filename, fileContent, patches) => {
             (0,core.info)(`reviewing ${filename}`);
             // make a copy of inputs
@@ -6283,8 +6319,17 @@ ${commentChain}
                             continue;
                         }
                         try {
-                            reviewCount += 1;
-                            await commenter.bufferReviewComment(filename, review.startLine, review.endLine, `${review.comment}`);
+                            // Check if a similar comment has been resolved previously
+                            const isResolved = await commenter.isCommentResolved(context.payload.pull_request.number, filename, review.startLine, review.endLine);
+                            if (!isResolved) {
+                                reviewCount += 1;
+                                await commenter.bufferReviewComment(filename, review.startLine, review.endLine, `${review.comment}`, review.score);
+                            }
+                            else {
+                                // Skip this comment as it was previously resolved
+                                (0,core.info)(`Skipping previously resolved comment for ${filename}:${review.startLine}-${review.endLine}`);
+                                resolvedCommentCount += 1;
+                            }
                         }
                         catch (e) {
                             reviewsFailed.push(`${filename} comment failed (${e})`);
@@ -6336,6 +6381,7 @@ ${reviewsSkipped.length > 0
 
 * Review: ${reviewCount}
 * LGTM: ${lgtmCount}
+* Skipped (previously resolved): ${resolvedCommentCount}
 
 </details>
 
@@ -6343,14 +6389,6 @@ ${reviewsSkipped.length > 0
 
 <details>
 <summary>Tips</summary>
-
-### Chat with AI reviewer (\`/reviewbot\`)
-- Reply on review comments left by this bot to ask follow-up questions. A review comment is a comment on a diff or a file.
-- Invite the bot into a review comment chain by tagging \`/reviewbot\` in a reply.
-
-### Code suggestions
-- The bot may make code suggestions, but please review them carefully before committing since the line number ranges may be misaligned. 
-- You can edit the comment made by the bot and manually tweak the suggestion if it is slightly off.
 
 ### Pausing incremental reviews
 - Add \`/reviewbot: ignore\` anywhere in the PR description to pause further reviews from the bot.
@@ -6470,7 +6508,8 @@ patches) {
                 reviews.push({
                     startLine: r.line_start ?? 0,
                     endLine: r.line_end ?? 0,
-                    comment: r.comment
+                    comment: r.comment,
+                    score: r.score ?? 5 // Default to medium severity (5) if not specified
                 });
             }
         }

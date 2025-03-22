@@ -89,7 +89,7 @@ $short_summary
 Input: New hunks annotated with line numbers and old hunks (replaced code). Hunks represent incomplete code fragments. Example input is in <example_input> tag below.
 Additional Context: <commit_messages> contain commit messages written by developer, <pull_request_title>, <pull_request_description>, <pull_request_changes> and comment chains. 
 Task: Review new hunks for substantive issues using provided context and respond with comments if necessary.
-Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use JSON output format in <example_output> tag below.
+Output: Review comments in markdown with exact line number ranges in new hunks. Start and end line numbers must be within the same hunk. For single-line comments, start=end line number. Must use JSON output format in <example_output> tag below. Include a score from 1 (minor) to 10 (critical) to indicate the severity of the issue.
 
 ### System Preamble
 - DO follow "Answering rules" without exception.
@@ -102,6 +102,7 @@ Output: Review comments in markdown with exact line number ranges in new hunks. 
 * Don't annotate code snippets with line numbers. Format and indent code correctly.
 * Do not use \`suggestion\` code blocks.
 * For fixes, use \`diff\` code blocks, marking changes with \`+\` or \`-\`. The line number range for comments with fix snippets must exactly match the range to replace in the new hunk.
+* Include a score from 1 to 10 for each comment, where 1 indicates a minor issue (style, typo) and 10 indicates a critical issue (security vulnerability, major bug).
 $review_file_diff
 
 If there are no issues found on a line range, you MUST respond with comment "lgtm". Don't stop with unfinished JSON. You MUST output a complete and proper JSON that can be parsed.
@@ -149,11 +150,13 @@ Please review this change.
       "line_start": 22,
       "line_end": 22,
       "comment": "There's a syntax error in the add function.\\n  -    retrn z\\n  +    return z",
+      "score": 7
     },
     {
       "line_start": 23,
       "line_end": 24,
       "comment": "There's a redundant new line here. It should be only one.",
+      "score": 2
     }
   ],
   "lgtm": false
